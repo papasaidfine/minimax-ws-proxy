@@ -1,0 +1,19 @@
+[project]
+name = "minimax-ws-proxy"
+version = "0.1.0"
+description = "Lightweight Anthropic API proxy for MiniMax with web_search_20250305/20260209 support"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+minimax-ws-proxy = "minimax_ws_proxy:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/minimax_ws_proxy"]
