@@ -183,11 +183,18 @@ async def resolve(
         content = resp.get("content", [])
 
         # Find search calls in this round
-        searches = [
-            b
-            for b in content
-            if b.get("type") == "tool_use" and b.get("name") == tool_name and used < max_uses
-        ]
+        # Match both "tool_use" (model called our injected tool) and
+        # "server_tool_use" (model generated Anthropic-native format from system prompt)
+        def _is_search(b: dict) -> bool:
+            bt = b.get("type", "")
+            name = b.get("name", "")
+            return (
+                bt in ("tool_use", "server_tool_use")
+                and name in (tool_name, "web_search")
+                and used < max_uses
+            )
+
+        searches = [b for b in content if _is_search(b)]
 
         if not searches:
             # Done - merge and return
@@ -217,7 +224,7 @@ async def resolve(
         has_other_tools = False
         for b in content:
             bid = b.get("id", "")
-            if b.get("type") == "tool_use" and bid in results_map:
+            if b.get("type") in ("tool_use", "server_tool_use") and bid in results_map:
                 q, data = results_map[bid]
                 sid = f"srvtoolu_{uuid.uuid4().hex[:20]}"
                 collected.append(
@@ -253,8 +260,16 @@ async def resolve(
             return resp
 
         # Only search calls - build next round messages
+        # Normalize server_tool_use → tool_use in assistant content for MiniMax
+        normalized = []
+        for b in content:
+            if b.get("type") == "server_tool_use" and b.get("id") in results_map:
+                normalized.append({**b, "type": "tool_use"})
+            else:
+                normalized.append(b)
+
         msgs = list(body.get("messages", []))
-        msgs.append({"role": "assistant", "content": content})
+        msgs.append({"role": "assistant", "content": normalized})
         msgs.append(
             {
                 "role": "user",
@@ -428,12 +443,19 @@ async def handle_messages(req: web.Request) -> web.StreamResponse:
     hdrs = {k.lower(): v for k, v in req.headers.items()}
     streaming = body.get("stream", False)
 
+    # Debug: log incoming tool types
+    if body.get("tools"):
+        tool_types = [t.get("type", t.get("name", "?")) for t in body["tools"]]
+        log.info("Incoming tools: %s  stream=%s", tool_types, streaming)
+
     # Clean history
     if "messages" in body:
         body["messages"] = clean_history(body["messages"])
 
     # Extract web_search_20250305
     body, ws_cfg, tool_name = strip_ws_tool(body)
+    if ws_cfg:
+        log.info("Stripped %s -> injected tool '%s'", ws_cfg.get("type"), tool_name)
     session: aiohttp.ClientSession = req.app["http"]
 
     # --- No web search: transparent proxy ---
