@@ -20,7 +20,7 @@ API key 和模型由客户端透传（`x-api-key` 头），代理本身不存储
 cp .env.example .env
 # 编辑 .env（海外版改为 https://api.minimax.io）
 
-uv run proxy.py
+./run.sh
 ```
 
 Claude Code 侧：

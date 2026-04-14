@@ -1,8 +1,19 @@
 """
-minimax-ws-proxy: Lightweight Anthropic API proxy for MiniMax with web_search support.
+minimax-ws-proxy: Lightweight Anthropic API proxy for MiniMax with web_search_20250305 support.
 
-API key is passed through from the client (x-api-key header).
+API key and model are passed through from the client (x-api-key header).
 The proxy only needs to know where MiniMax is.
+
+Usage:
+    uv run proxy.py
+    # Then in Claude Code:
+    #   ANTHROPIC_BASE_URL=http://127.0.0.1:8082
+    #   ANTHROPIC_API_KEY=your_minimax_key
+
+Environment variables (proxy-side):
+    MINIMAX_API_HOST  - MiniMax API host (default: https://api.minimaxi.com)
+    HOST              - Proxy listen host (default: 127.0.0.1)
+    PORT              - Proxy listen port (default: 8082)
 """
 
 import json
@@ -18,6 +29,60 @@ import aiohttp
 from aiohttp import web
 
 log = logging.getLogger("minimax-ws-proxy")
+
+
+def _summarize_blocks(blocks: list) -> str:
+    parts = []
+    for b in blocks or []:
+        bt = b.get("type", "?")
+        if bt == "text":
+            t = b.get("text", "")
+            parts.append(f"text({len(t)}ch:{t[:60]!r})")
+        elif bt == "thinking":
+            parts.append(f"thinking({len(b.get('thinking',''))}ch)")
+        elif bt in ("tool_use", "server_tool_use"):
+            q = b.get("input", {}).get("query", "")
+            parts.append(f"{bt}({b.get('name','?')},{b.get('id','')[:12]},q={q!r})")
+        elif bt == "web_search_tool_result":
+            c = b.get("content")
+            n = len(c) if isinstance(c, list) else f"err:{c.get('error_code','?')}" if isinstance(c, dict) else "?"
+            parts.append(f"ws_result(n={n})")
+        elif bt == "tool_result":
+            parts.append(f"tool_result({b.get('tool_use_id','')[:12]})")
+        else:
+            parts.append(bt)
+    return "[" + ", ".join(parts) + "]"
+
+
+def _usage(in_t: int, out_t: int, used: int) -> dict:
+    return {
+        "input_tokens": in_t,
+        "output_tokens": out_t,
+        "server_tool_use": {"web_search_requests": used},
+    }
+
+
+def _ws_result(sid: str, kind: str, payload) -> dict:
+    if kind == "error":
+        return {
+            "type": "web_search_tool_result",
+            "tool_use_id": sid,
+            "content": {"type": "web_search_tool_result_error", "error_code": payload},
+        }
+    return {
+        "type": "web_search_tool_result",
+        "tool_use_id": sid,
+        "content": [
+            {
+                "type": "web_search_result",
+                "url": r.get("link", ""),
+                "title": r.get("title", ""),
+                "encrypted_content": r.get("snippet", ""),
+                "page_age": r.get("date", ""),
+            }
+            for r in payload.get("organic", [])
+        ],
+    }
 
 # ---------------------------------------------------------------------------
 # Config
@@ -93,6 +158,9 @@ def strip_ws_tool(body: dict) -> tuple[dict, dict | None, str]:
             },
         }
     )
+    unsupported = [k for k in ("allowed_domains", "blocked_domains", "user_location") if k in ws_config]
+    if unsupported:
+        log.warning("web_search tool specified %s; MiniMax search API ignores these", unsupported)
     return {**body, "tools": kept}, ws_config, name
 
 
@@ -140,12 +208,25 @@ def _fwd_headers(req_headers: dict, api_key: str) -> dict:
 
 async def _call(session: aiohttp.ClientSession, body: dict, api_key: str, headers: dict) -> dict:
     """Non-streaming POST to MiniMax Anthropic endpoint."""
+    msgs = body.get("messages", [])
+    tools = [t.get("name", t.get("type", "?")) for t in body.get("tools", [])]
+    log.info("→ MiniMax: model=%s msgs=%d tools=%s", body.get("model"), len(msgs), tools)
     async with session.post(
         f"{MINIMAX_API_HOST}/anthropic/v1/messages",
         json={**body, "stream": False},
         headers=_fwd_headers(headers, api_key),
     ) as r:
-        return await r.json()
+        resp = await r.json()
+    if resp.get("type") == "error" or "error" in resp:
+        log.warning("← MiniMax ERROR: %s", resp)
+    else:
+        log.info(
+            "← MiniMax: stop=%s usage=%s blocks=%s",
+            resp.get("stop_reason"),
+            resp.get("usage"),
+            _summarize_blocks(resp.get("content", [])),
+        )
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -163,89 +244,75 @@ async def resolve(
 ) -> dict:
     """Call MiniMax, resolve web-search tool calls in a loop, return final response."""
     used = 0
-    collected: list[dict] = []  # accumulated content blocks
+    collected: list[dict] = []
     total_in = 0
     total_out = 0
+    round_idx = 0
+
+    def _is_search(b: dict) -> bool:
+        return (
+            b.get("type") in ("tool_use", "server_tool_use")
+            and b.get("name") in (tool_name, "web_search")
+        )
 
     while True:
+        round_idx += 1
         resp = await _call(session, body, api_key, headers)
-
-        # Accumulate usage
         usage = resp.get("usage", {})
         total_in += usage.get("input_tokens", 0)
         total_out += usage.get("output_tokens", 0)
 
-        # Check for errors from MiniMax
         if resp.get("type") == "error" or "error" in resp:
             resp["content"] = collected + resp.get("content", [])
             return resp
 
         content = resp.get("content", [])
-
-        # Find search calls in this round
-        # Match both "tool_use" (model called our injected tool) and
-        # "server_tool_use" (model generated Anthropic-native format from system prompt)
-        def _is_search(b: dict) -> bool:
-            bt = b.get("type", "")
-            name = b.get("name", "")
-            return (
-                bt in ("tool_use", "server_tool_use")
-                and name in (tool_name, "web_search")
-                and used < max_uses
-            )
-
         searches = [b for b in content if _is_search(b)]
 
         if not searches:
-            # Done - merge and return
             collected.extend(content)
             resp["content"] = collected
-            resp["usage"] = {
-                "input_tokens": total_in,
-                "output_tokens": total_out,
-                "server_tool_use": {"web_search_requests": used},
-            }
+            resp["usage"] = _usage(total_in, total_out, used)
+            log.info(
+                "✓ resolve done  rounds=%d searches=%d blocks=%s",
+                round_idx, used, _summarize_blocks(collected),
+            )
             return resp
 
-        # Execute searches
-        results_map: dict[str, tuple[str, dict]] = {}
+        # results_map[id] = (query, (kind, payload))
+        #   kind="ok"    -> payload is search data dict
+        #   kind="error" -> payload is web_search error_code
+        results_map: dict = {}
         for sc in searches:
-            used += 1
             q = sc.get("input", {}).get("query", "")
-            log.info("Web search [%d/%d]: %s", used, max_uses, q)
+            if used >= max_uses:
+                log.info("  Web search SKIPPED max_uses_exceeded: %s", q)
+                results_map[sc["id"]] = (q, ("error", "max_uses_exceeded"))
+                continue
+            used += 1
             try:
                 data = await do_search(session, q, api_key)
             except Exception as exc:
-                log.warning("Search failed for %r: %s", q, exc)
-                data = {"organic": []}
-            results_map[sc["id"]] = (q, data)
+                log.warning("  Web search [%d/%d] FAILED: %s (%s)", used, max_uses, q, exc)
+                results_map[sc["id"]] = (q, ("error", "unavailable"))
+                continue
+            log.info(
+                "  Web search [%d/%d]: %s → %d results",
+                used, max_uses, q, len(data.get("organic", [])),
+            )
+            results_map[sc["id"]] = (q, ("ok", data))
 
-        # Build transformed content for this round (preserve block order)
+        # Build this round's content (preserve block order)
         has_other_tools = False
         for b in content:
             bid = b.get("id", "")
             if b.get("type") in ("tool_use", "server_tool_use") and bid in results_map:
-                q, data = results_map[bid]
+                q, (kind, payload) = results_map[bid]
                 sid = f"srvtoolu_{uuid.uuid4().hex[:20]}"
                 collected.append(
                     {"type": "server_tool_use", "id": sid, "name": "web_search", "input": {"query": q}}
                 )
-                collected.append(
-                    {
-                        "type": "web_search_tool_result",
-                        "tool_use_id": sid,
-                        "content": [
-                            {
-                                "type": "web_search_result",
-                                "url": r.get("link", ""),
-                                "title": r.get("title", ""),
-                                "encrypted_content": r.get("snippet", ""),
-                                "page_age": r.get("date", ""),
-                            }
-                            for r in data.get("organic", [])
-                        ],
-                    }
-                )
+                collected.append(_ws_result(sid, kind, payload))
             elif b.get("type") == "tool_use":
                 has_other_tools = True
                 collected.append(b)
@@ -253,39 +320,40 @@ async def resolve(
                 collected.append(b)
 
         if has_other_tools:
-            # Mixed: return now, let Claude Code handle the regular tool calls
+            # Mixed: let Claude Code handle regular tool calls
             resp["content"] = collected
             resp["stop_reason"] = "tool_use"
-            resp["usage"] = {"input_tokens": total_in, "output_tokens": total_out}
+            resp["usage"] = _usage(total_in, total_out, used)
+            log.info("✓ resolve mixed-exit  rounds=%d searches=%d", round_idx, used)
             return resp
 
-        # Only search calls - build next round messages
-        # Normalize server_tool_use → tool_use in assistant content for MiniMax
-        normalized = []
-        for b in content:
-            if b.get("type") == "server_tool_use" and b.get("id") in results_map:
-                normalized.append({**b, "type": "tool_use"})
-            else:
-                normalized.append(b)
+        # Normalize server_tool_use → tool_use for MiniMax's next turn
+        normalized = [
+            {**b, "type": "tool_use"} if b.get("type") == "server_tool_use" and b.get("id") in results_map else b
+            for b in content
+        ]
+
+        tool_results = []
+        for sc in searches:
+            _, (kind, payload) = results_map[sc["id"]]
+            tr = {"error": payload} if kind == "error" else payload.get("organic", [])
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": sc["id"],
+                "content": json.dumps(tr, ensure_ascii=False),
+            })
 
         msgs = list(body.get("messages", []))
         msgs.append({"role": "assistant", "content": normalized})
-        msgs.append(
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": sc["id"],
-                        "content": json.dumps(
-                            results_map[sc["id"]][1].get("organic", []), ensure_ascii=False
-                        ),
-                    }
-                    for sc in searches
-                ],
-            }
-        )
+        msgs.append({"role": "user", "content": tool_results})
         body = {**body, "messages": msgs}
+
+        if round_idx > max_uses + 3:
+            log.warning("resolve loop exceeded safety cap at round %d; bailing", round_idx)
+            resp["content"] = collected
+            resp["stop_reason"] = "end_turn"
+            resp["usage"] = _usage(total_in, total_out, used)
+            return resp
 
 
 # ---------------------------------------------------------------------------
