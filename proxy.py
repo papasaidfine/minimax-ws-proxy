@@ -209,7 +209,11 @@ async def resolve(
             # Done - merge and return
             collected.extend(content)
             resp["content"] = collected
-            resp["usage"] = {"input_tokens": total_in, "output_tokens": total_out}
+            resp["usage"] = {
+                "input_tokens": total_in,
+                "output_tokens": total_out,
+                "server_tool_use": {"web_search_requests": used},
+            }
             return resp
 
         # Execute searches
@@ -420,7 +424,7 @@ def to_sse(resp: dict) -> bytes:
         {
             "type": "message_delta",
             "delta": {"stop_reason": resp.get("stop_reason", "end_turn"), "stop_sequence": None},
-            "usage": {"output_tokens": resp.get("usage", {}).get("output_tokens", 0)},
+            "usage": resp.get("usage", {"output_tokens": 0}),
         },
     )
     ev("message_stop", {"type": "message_stop"})
