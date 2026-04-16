@@ -6,6 +6,7 @@ requires-python = ">=3.10"
 dependencies = [
     "aiohttp>=3.9",
     "python-dotenv>=1.0",
+    "mcp>=1.0",
 ]
 
 [project.scripts]

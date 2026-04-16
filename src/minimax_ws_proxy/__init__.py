@@ -1,34 +1,41 @@
 """
-minimax-ws-proxy: Lightweight Anthropic API proxy for MiniMax with web_search_20250305 support.
+minimax-ws-proxy: Lightweight Anthropic API proxy with web_search_20250305 support.
 
-API key and model are passed through from the client (x-api-key header).
-The proxy only needs to know where MiniMax is.
+Reads everything from config.json (host/port/upstream/backends). A `.env`
+file is loaded into the process environment so config.json can reference
+secrets via `$VAR` / `${VAR}`.
 
 Usage:
-    uv run proxy.py
-    # Then in Claude Code:
-    #   ANTHROPIC_BASE_URL=http://127.0.0.1:8082
-    #   ANTHROPIC_API_KEY=your_minimax_key
-
-Environment variables (proxy-side):
-    MINIMAX_API_HOST  - MiniMax API host (default: https://api.minimaxi.com)
-    HOST              - Proxy listen host (default: 127.0.0.1)
-    PORT              - Proxy listen port (default: 8082)
+    uv run minimax-ws-proxy                       # uses ./config.json
+    uv run minimax-ws-proxy --config /path/to.json
 """
 
+import asyncio
 import json
 import logging
 import os
+import sys
 import uuid
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv()  # populate os.environ from .env so $VAR refs in config resolve
 
 import aiohttp
 from aiohttp import web
 
+from .backends import SearchBackend, build_backend
+from .config import AppConfig, load_config
+
 log = logging.getLogger("minimax-ws-proxy")
+
+INTERNAL_TOOL = "__proxy_web_search__"
+ANTHROPIC_WS_TYPES = {"web_search_20250305", "web_search_20260209"}
+
+
+# ---------------------------------------------------------------------------
+# Helpers (unchanged)
+# ---------------------------------------------------------------------------
 
 
 def _summarize_blocks(blocks: list) -> str:
@@ -62,7 +69,6 @@ def _usage(in_t: int, out_t: int, used: int) -> dict:
     }
 
 
-# Anthropic-standard error types. Anything else gets bucketed into "api_error".
 _SAFE_ERROR_TYPES = {
     "invalid_request_error",
     "authentication_error",
@@ -98,12 +104,6 @@ _ERROR_HTTP_STATUS = {
 
 
 def _sanitize_error(raw) -> dict:
-    """Map any upstream error shape to a generic Anthropic error object.
-
-    Only the error *type* is preserved (from a whitelist); the message is
-    always replaced with a canned string so upstream vendor names, internal
-    field identifiers, or backend URLs never reach the client.
-    """
     inner: dict = {}
     if isinstance(raw, dict):
         candidate = raw.get("error", raw)
@@ -116,7 +116,6 @@ def _sanitize_error(raw) -> dict:
 
 
 def _error_json_response(raw) -> web.Response:
-    """Build a non-streaming Anthropic-spec error response with sanitized body."""
     sanitized = _sanitize_error(raw)
     status = _ERROR_HTTP_STATUS.get(sanitized["type"], 500)
     return web.json_response(
@@ -147,34 +146,6 @@ def _ws_result(sid: str, kind: str, payload) -> dict:
         ],
     }
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-MINIMAX_API_HOST = os.environ.get("MINIMAX_API_HOST", "https://api.minimaxi.com")
-HOST = os.environ.get("HOST", "127.0.0.1")
-PORT = int(os.environ.get("PORT", "8082"))
-
-INTERNAL_TOOL = "__proxy_web_search__"
-ANTHROPIC_WS_TYPES = {"web_search_20250305", "web_search_20260209"}
-
-# ---------------------------------------------------------------------------
-# MiniMax search API
-# ---------------------------------------------------------------------------
-
-
-async def do_search(session: aiohttp.ClientSession, query: str, api_key: str) -> dict:
-    """POST /v1/coding_plan/search -> {organic: [...], related_searches: [...]}"""
-    async with session.post(
-        f"{MINIMAX_API_HOST}/v1/coding_plan/search",
-        json={"q": query},
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    ) as r:
-        return await r.json()
-
 
 # ---------------------------------------------------------------------------
 # Request transformation
@@ -182,7 +153,6 @@ async def do_search(session: aiohttp.ClientSession, query: str, api_key: str) ->
 
 
 def _pick_internal_name(tools: list[dict]) -> str:
-    """Avoid name collision with user-defined tools."""
     names = {t.get("name") for t in tools}
     if "web_search" not in names:
         return "web_search"
@@ -190,10 +160,6 @@ def _pick_internal_name(tools: list[dict]) -> str:
 
 
 def strip_ws_tool(body: dict) -> tuple[dict, dict | None, str]:
-    """Remove web_search_20250305 from tools, inject a regular tool.
-
-    Returns (modified_body, ws_config_or_None, internal_tool_name).
-    """
     tools = body.get("tools")
     if not tools:
         return body, None, ""
@@ -223,12 +189,11 @@ def strip_ws_tool(body: dict) -> tuple[dict, dict | None, str]:
     )
     unsupported = [k for k in ("allowed_domains", "blocked_domains", "user_location") if k in ws_config]
     if unsupported:
-        log.warning("web_search tool specified %s; MiniMax search API ignores these", unsupported)
+        log.warning("web_search tool specified %s; search backend ignores these", unsupported)
     return {**body, "tools": kept}, ws_config, name
 
 
 def clean_history(messages: list[dict]) -> list[dict]:
-    """Convert server_tool_use / web_search_tool_result blocks to text so MiniMax can digest them."""
     out: list[dict] = []
     for msg in messages:
         if msg.get("role") != "assistant" or not isinstance(msg.get("content"), list):
@@ -269,22 +234,27 @@ def _fwd_headers(req_headers: dict, api_key: str) -> dict:
     return h
 
 
-async def _call(session: aiohttp.ClientSession, body: dict, api_key: str, headers: dict) -> dict:
-    """Non-streaming POST to MiniMax Anthropic endpoint."""
+async def _call(
+    session: aiohttp.ClientSession,
+    upstream: str,
+    body: dict,
+    api_key: str,
+    headers: dict,
+) -> dict:
     msgs = body.get("messages", [])
     tools = [t.get("name", t.get("type", "?")) for t in body.get("tools", [])]
-    log.info("→ MiniMax: model=%s msgs=%d tools=%s", body.get("model"), len(msgs), tools)
+    log.info("→ upstream: model=%s msgs=%d tools=%s", body.get("model"), len(msgs), tools)
     async with session.post(
-        f"{MINIMAX_API_HOST}/anthropic/v1/messages",
+        f"{upstream}/v1/messages",
         json={**body, "stream": False},
         headers=_fwd_headers(headers, api_key),
     ) as r:
         resp = await r.json()
     if resp.get("type") == "error" or "error" in resp:
-        log.warning("← MiniMax ERROR: %s", resp)
+        log.warning("← upstream ERROR: %s", resp)
     else:
         log.info(
-            "← MiniMax: stop=%s usage=%s blocks=%s",
+            "← upstream: stop=%s usage=%s blocks=%s",
             resp.get("stop_reason"),
             resp.get("usage"),
             _summarize_blocks(resp.get("content", [])),
@@ -306,13 +276,14 @@ def _is_ws_call(b: dict, tool_name: str) -> bool:
 
 async def resolve(
     session: aiohttp.ClientSession,
+    upstream: str,
+    backend: SearchBackend,
     body: dict,
     api_key: str,
     headers: dict,
     tool_name: str,
     max_uses: int = 5,
 ) -> dict:
-    """Call MiniMax, resolve web-search tool calls in a loop, return final response."""
     used = 0
     collected: list[dict] = []
     total_in = 0
@@ -322,7 +293,7 @@ async def resolve(
     while True:
         round_idx += 1
         try:
-            resp = await _call(session, body, api_key, headers)
+            resp = await _call(session, upstream, body, api_key, headers)
         except Exception as exc:
             log.warning("resolve: upstream call failed at round %d: %r", round_idx, exc)
             return {"__error__": {"type": "api_error"}}
@@ -347,9 +318,6 @@ async def resolve(
             )
             return resp
 
-        # results_map[id] = (query, (kind, payload))
-        #   kind="ok"    -> payload is search data dict
-        #   kind="error" -> payload is web_search error_code
         results_map: dict = {}
         for sc in searches:
             q = sc.get("input", {}).get("query", "")
@@ -359,7 +327,7 @@ async def resolve(
                 continue
             used += 1
             try:
-                data = await do_search(session, q, api_key)
+                data = await backend.search(q, api_key)
             except Exception as exc:
                 log.warning("  Web search [%d/%d] FAILED: %s (%s)", used, max_uses, q, exc)
                 results_map[sc["id"]] = (q, ("error", "unavailable"))
@@ -370,7 +338,6 @@ async def resolve(
             )
             results_map[sc["id"]] = (q, ("ok", data))
 
-        # Build this round's content (preserve block order)
         has_other_tools = False
         for b in content:
             bid = b.get("id", "")
@@ -388,14 +355,12 @@ async def resolve(
                 collected.append(b)
 
         if has_other_tools:
-            # Mixed: let Claude Code handle regular tool calls
             resp["content"] = collected
             resp["stop_reason"] = "tool_use"
             resp["usage"] = _usage(total_in, total_out, used)
             log.info("✓ resolve mixed-exit  rounds=%d searches=%d", round_idx, used)
             return resp
 
-        # Normalize server_tool_use → tool_use for MiniMax's next turn
         normalized = [
             {**b, "type": "tool_use"} if b.get("type") == "server_tool_use" and b.get("id") in results_map else b
             for b in content
@@ -436,11 +401,6 @@ async def _sse(resp: web.StreamResponse, event: str, data: dict) -> None:
 
 
 async def _sse_error(resp: web.StreamResponse, raw) -> None:
-    """Emit an Anthropic-spec `error` SSE event with a sanitized payload.
-
-    After this event the stream is terminal — Anthropic SDK will raise.
-    Caller should return immediately without emitting message_stop.
-    """
     await _sse(resp, "error", {"type": "error", "error": _sanitize_error(raw)})
 
 
@@ -478,6 +438,8 @@ async def _sse_block(resp: web.StreamResponse, idx: int, block: dict) -> None:
 
 async def resolve_streaming(
     session: aiohttp.ClientSession,
+    upstream: str,
+    backend: SearchBackend,
     body: dict,
     api_key: str,
     headers: dict,
@@ -485,7 +447,6 @@ async def resolve_streaming(
     resp: web.StreamResponse,
     max_uses: int = 5,
 ) -> None:
-    """Resolve web_search loop while streaming SSE to the client as each block becomes available."""
     msg_id = f"msg_{uuid.uuid4().hex[:20]}"
     await _sse(resp, "message_start", {
         "type": "message_start",
@@ -507,7 +468,7 @@ async def resolve_streaming(
     while True:
         round_idx += 1
         try:
-            r = await _call(session, body, api_key, headers)
+            r = await _call(session, upstream, body, api_key, headers)
         except Exception as exc:
             log.warning("resolve_streaming: upstream call failed at round %d: %r", round_idx, exc)
             await _sse_error(resp, {"type": "api_error"})
@@ -538,7 +499,6 @@ async def resolve_streaming(
             if _is_ws_call(b, tool_name):
                 q = b.get("input", {}).get("query", "")
                 sid = f"srvtoolu_{uuid.uuid4().hex[:20]}"
-                # Emit server_tool_use first so UI shows "Searching: <query>" during the wait.
                 await _sse_block(resp, idx,
                                  {"type": "server_tool_use", "id": sid, "name": "web_search",
                                   "input": {"query": q}})
@@ -549,7 +509,7 @@ async def resolve_streaming(
                 else:
                     used += 1
                     try:
-                        data = await do_search(session, q, api_key)
+                        data = await backend.search(q, api_key)
                         kind, payload = "ok", data
                         log.info("  Web search [%d/%d]: %s → %d results",
                                  used, max_uses, q, len(data.get("organic", [])))
@@ -609,7 +569,6 @@ async def resolve_streaming(
 
 
 def to_sse(resp: dict) -> bytes:
-    """Convert a buffered JSON response into Anthropic SSE stream bytes."""
     chunks: list[str] = []
 
     def ev(event: str, data: dict):
@@ -747,27 +706,24 @@ def to_sse(resp: dict) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# HTTP handlers
+# HTTP handlers — read upstream/backend from app context
 # ---------------------------------------------------------------------------
 
 
 async def handle_messages(req: web.Request) -> web.StreamResponse:
-    """POST /v1/messages - main proxy handler."""
     body = await req.json()
     api_key = req.headers["x-api-key"]
     hdrs = {k.lower(): v for k, v in req.headers.items()}
     streaming = body.get("stream", False)
+    upstream: str = req.app["upstream"]
 
-    # Debug: log incoming tool types
     if body.get("tools"):
         tool_types = [t.get("type", t.get("name", "?")) for t in body["tools"]]
         log.info("Incoming tools: %s  stream=%s", tool_types, streaming)
 
-    # Clean history
     if "messages" in body:
         body["messages"] = clean_history(body["messages"])
 
-    # Extract web_search_20250305
     body, ws_cfg, tool_name = strip_ws_tool(body)
     if ws_cfg:
         log.info("Stripped %s -> injected tool '%s'", ws_cfg.get("type"), tool_name)
@@ -781,16 +737,16 @@ async def handle_messages(req: web.Request) -> web.StreamResponse:
             )
             await resp.prepare(req)
             async with session.post(
-                f"{MINIMAX_API_HOST}/anthropic/v1/messages",
+                f"{upstream}/v1/messages",
                 json=body,
                 headers=_fwd_headers(hdrs, api_key),
-            ) as upstream:
-                async for chunk in upstream.content.iter_any():
+            ) as up:
+                async for chunk in up.content.iter_any():
                     await resp.write(chunk)
             return resp
         else:
             try:
-                data = await _call(session, body, api_key, hdrs)
+                data = await _call(session, upstream, body, api_key, hdrs)
             except Exception as exc:
                 log.warning("transparent proxy: upstream call failed: %r", exc)
                 return _error_json_response({"type": "api_error"})
@@ -800,52 +756,96 @@ async def handle_messages(req: web.Request) -> web.StreamResponse:
 
     # --- Has web search: resolve loop ---
     max_uses = ws_cfg.get("max_uses", 5)
+    backend: SearchBackend = req.app["backend"]
 
     if streaming:
         resp = web.StreamResponse(
             headers={"content-type": "text/event-stream", "cache-control": "no-cache"}
         )
         await resp.prepare(req)
-        await resolve_streaming(session, body, api_key, hdrs, tool_name, resp, max_uses)
+        await resolve_streaming(session, upstream, backend, body, api_key, hdrs, tool_name, resp, max_uses)
         return resp
     else:
-        result = await resolve(session, body, api_key, hdrs, tool_name, max_uses)
+        result = await resolve(session, upstream, backend, body, api_key, hdrs, tool_name, max_uses)
         if "__error__" in result:
             return _error_json_response(result["__error__"])
         return web.json_response(result)
 
 
 async def handle_other(req: web.Request) -> web.StreamResponse:
-    """Proxy any other path transparently."""
     raw = await req.read()
     api_key = req.headers["x-api-key"]
     hdrs = _fwd_headers({k.lower(): v for k, v in req.headers.items()}, api_key)
     session: aiohttp.ClientSession = req.app["http"]
+    upstream: str = req.app["upstream"]
 
     async with session.request(
         req.method,
-        f"{MINIMAX_API_HOST}/anthropic{req.path}",
+        f"{upstream}{req.path}",
         data=raw,
         headers=hdrs,
-    ) as upstream:
+    ) as up:
         return web.Response(
-            status=upstream.status,
-            body=await upstream.read(),
-            content_type=upstream.content_type,
+            status=up.status,
+            body=await up.read(),
+            content_type=up.content_type,
         )
 
 
 # ---------------------------------------------------------------------------
-# App setup
+# App factory & multi-proxy runner
 # ---------------------------------------------------------------------------
 
 
-async def on_startup(app: web.Application):
-    app["http"] = aiohttp.ClientSession()
+def create_app(upstream: str, backend: SearchBackend | None) -> web.Application:
+    app = web.Application()
+    app["upstream"] = upstream
+    if backend is not None:
+        app["backend"] = backend
+
+    async def _on_startup(app: web.Application):
+        app["http"] = aiohttp.ClientSession()
+
+    async def _on_cleanup(app: web.Application):
+        await app["http"].close()
+
+    app.on_startup.append(_on_startup)
+    app.on_cleanup.append(_on_cleanup)
+    app.router.add_post("/v1/messages", handle_messages)
+    app.router.add_route("*", "/{path:.*}", handle_other)
+    return app
 
 
-async def on_cleanup(app: web.Application):
-    await app["http"].close()
+async def _run_multi(config: AppConfig) -> None:
+    backends: dict[str, SearchBackend] = {}
+    for name, bcfg in config.backends.items():
+        b = build_backend(bcfg)
+        await b.start()
+        backends[name] = b
+        log.info("Backend '%s' (%s) started", name, bcfg.type)
+
+    runners: list[web.AppRunner] = []
+    sites: list[web.TCPSite] = []
+
+    try:
+        for pcfg in config.proxies:
+            backend = backends.get(pcfg.search_backend) if pcfg.search_backend else None
+            app = create_app(pcfg.upstream, backend)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, pcfg.host, pcfg.port)
+            await site.start()
+            runners.append(runner)
+            sites.append(site)
+            log.info("Proxy '%s' listening on %s -> %s  backend=%s",
+                     pcfg.name, pcfg.listen, pcfg.upstream, pcfg.search_backend or "(none)")
+
+        await asyncio.Event().wait()  # run forever
+    finally:
+        for runner in runners:
+            await runner.cleanup()
+        for b in backends.values():
+            await b.stop()
 
 
 def main():
@@ -853,14 +853,28 @@ def main():
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     )
-    app = web.Application()
-    app.on_startup.append(on_startup)
-    app.on_cleanup.append(on_cleanup)
-    app.router.add_post("/v1/messages", handle_messages)
-    app.router.add_route("*", "/{path:.*}", handle_other)
 
-    log.info("minimax-ws-proxy  %s:%d -> %s", HOST, PORT, MINIMAX_API_HOST)
-    web.run_app(app, host=HOST, port=PORT)
+    if "--config" in sys.argv:
+        idx = sys.argv.index("--config")
+        config_path = sys.argv[idx + 1]
+    elif os.environ.get("CONFIG_PATH"):
+        config_path = os.environ["CONFIG_PATH"]
+    else:
+        config_path = os.path.join(os.getcwd(), "config.json")
+
+    if not os.path.isfile(config_path):
+        sys.exit(f"config not found: {config_path}\n"
+                 "create one (see config.example.json) or pass --config <path>.")
+
+    log.info("Loading config from %s", config_path)
+    config = load_config(config_path)
+
+    if len(config.proxies) == 1:
+        p = config.proxies[0]
+        log.info("minimax-ws-proxy  %s -> %s  backend=%s",
+                 p.listen, p.upstream, p.search_backend or "(none)")
+
+    asyncio.run(_run_multi(config))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,31 @@
+{
+  "backends": {
+    "minimax-passthrough": {
+      "type": "rest",
+      "url": "https://api.minimaxi.com/v1/coding_plan/search",
+      "api_key": "$PASSTHRU_API_KEY"
+    },
+    "minimax-static-key": {
+      "type": "rest",
+      "url": "https://api.minimaxi.com/v1/coding_plan/search",
+      "api_key": "$MINIMAX_API_KEY"
+    },
+    "minimax-mcp-1": {
+      "type": "mcp",
+      "command": "uvx",
+      "args": ["minimax-coding-plan-mcp", "-y"],
+      "env": {
+        "MINIMAX_API_KEY": "$MINIMAX_API_KEY",
+        "MINIMAX_API_HOST": "https://api.minimaxi.com"
+      }
+    }
+  },
+  "proxies": [
+    {
+      "name": "default",
+      "listen": "127.0.0.1:8082",
+      "upstream": "https://api.minimaxi.com/anthropic",
+      "search_backend": "minimax-passthrough"
+    }
+  ]
+}
