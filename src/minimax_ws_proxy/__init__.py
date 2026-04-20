@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import sys
 import uuid
 
@@ -31,6 +32,83 @@ log = logging.getLogger("minimax-ws-proxy")
 
 INTERNAL_TOOL = "__proxy_web_search__"
 ANTHROPIC_WS_TYPES = {"web_search_20250305", "web_search_20260209"}
+
+# Hop-by-hop + length headers we must not blindly forward when mirroring an
+# upstream response. aiohttp handles framing itself.
+_HOP_BY_HOP_HEADERS = frozenset({
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "transfer-encoding", "upgrade", "content-length",
+})
+
+
+def _anthropic_msg_id() -> str:
+    """Mint a message id that matches the Anthropic `msg_01<22hex>` shape."""
+    return "msg_01" + secrets.token_hex(11)
+
+
+def _scrub_claude_message(obj: dict, client_model: str) -> None:
+    """Rewrite MiniMax-specific fields in a Claude `message` object in-place.
+
+    MiniMax's Anthropic-compatible endpoint returns `model` as its internal
+    name (e.g. `MiniMax-M2.7`), a 32-hex `id`, and a `base_resp` envelope —
+    all of which fingerprint the upstream. Replace them so consumers see
+    something shaped like a real Anthropic response.
+    """
+    if not isinstance(obj, dict):
+        return
+    if client_model:
+        obj["model"] = client_model
+    cur_id = obj.get("id")
+    if isinstance(cur_id, str) and not cur_id.startswith("msg_"):
+        obj["id"] = _anthropic_msg_id()
+    obj.pop("base_resp", None)
+
+
+def _scrub_response_body(raw: bytes, client_model: str) -> bytes:
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return raw
+    if isinstance(data, dict) and data.get("type") == "message":
+        _scrub_claude_message(data, client_model)
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return raw
+
+
+def _scrub_message_start_event(event_bytes: bytes, client_model: str) -> bytes:
+    """Rewrite the `message_start` SSE event's embedded message object.
+
+    Works on a single complete event (one or more lines terminated by a blank
+    line). Returns the bytes unchanged if parsing fails or if this isn't a
+    message_start event.
+    """
+    if b"message_start" not in event_bytes:
+        return event_bytes
+    try:
+        text = event_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return event_bytes
+    out_lines: list[str] = []
+    changed = False
+    for line in text.split("\n"):
+        if line.startswith("data:"):
+            payload = line[len("data:"):].lstrip()
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                out_lines.append(line)
+                continue
+            if isinstance(data, dict) and data.get("type") == "message_start":
+                msg = data.get("message")
+                if isinstance(msg, dict):
+                    _scrub_claude_message(msg, client_model)
+                    out_lines.append("data: " + json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+                    changed = True
+                    continue
+        out_lines.append(line)
+    if not changed:
+        return event_bytes
+    return "\n".join(out_lines).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +550,10 @@ async def resolve_streaming(
         except Exception as exc:
             log.warning("resolve_streaming: upstream call failed at round %d: %r", round_idx, exc)
             await _sse_error(resp, {"type": "api_error"})
+            # After event: error, emit message_stop (needed by strict consumers
+            # like sub2api) but skip the synthetic message_delta — a trailing
+            # stop_reason=end_turn would contradict the error we just sent.
+            await _sse(resp, "message_stop", {"type": "message_stop"})
             return
         usage = r.get("usage", {})
         total_in += usage.get("input_tokens", 0)
@@ -480,6 +562,7 @@ async def resolve_streaming(
         if r.get("type") == "error" or "error" in r:
             log.warning("resolve_streaming: upstream returned error at round %d", round_idx)
             await _sse_error(resp, r)
+            await _sse(resp, "message_stop", {"type": "message_stop"})
             return
 
         content = r.get("content", [])
@@ -729,30 +812,84 @@ async def handle_messages(req: web.Request) -> web.StreamResponse:
         log.info("Stripped %s -> injected tool '%s'", ws_cfg.get("type"), tool_name)
     session: aiohttp.ClientSession = req.app["http"]
 
+    client_model = body.get("model") or ""
+
     # --- No web search: transparent proxy ---
     if ws_cfg is None:
         if streaming:
-            resp = web.StreamResponse(
-                headers={"content-type": "text/event-stream", "cache-control": "no-cache"}
-            )
-            await resp.prepare(req)
             async with session.post(
                 f"{upstream}/v1/messages",
                 json=body,
                 headers=_fwd_headers(hdrs, api_key),
             ) as up:
-                async for chunk in up.content.iter_any():
-                    await resp.write(chunk)
+                # Mirror upstream status + headers verbatim. Rewrite only the
+                # `message_start` event's embedded message object to scrub
+                # MiniMax-specific fingerprints (`model`, `id`, `base_resp`);
+                # everything else streams unchanged.
+                fwd = {k: v for k, v in up.headers.items()
+                       if k.lower() not in _HOP_BY_HOP_HEADERS}
+                resp = web.StreamResponse(status=up.status, headers=fwd)
+                await resp.prepare(req)
+                is_sse = up.status == 200 and "text/event-stream" in (up.content_type or "")
+                saw_stop = False
+                tail = b""
+                # Buffer only until we've emitted the first SSE event
+                # (message_start). After that, pipe bytes directly.
+                first_event_buf = b""
+                first_event_done = not is_sse  # non-SSE → no rewriting, flush as-is
+                try:
+                    async for chunk in up.content.iter_any():
+                        out: bytes
+                        if first_event_done:
+                            out = chunk
+                        else:
+                            first_event_buf += chunk
+                            sep = first_event_buf.find(b"\n\n")
+                            if sep < 0:
+                                # Need more bytes to see the end of the first event.
+                                continue
+                            first = first_event_buf[:sep + 2]
+                            rest = first_event_buf[sep + 2:]
+                            first = _scrub_message_start_event(first, client_model)
+                            out = first + rest
+                            first_event_done = True
+                            first_event_buf = b""
+                        if is_sse and not saw_stop:
+                            combined = tail + out
+                            if b"message_stop" in combined:
+                                saw_stop = True
+                            tail = combined[-32:]
+                        await resp.write(out)
+                    # Upstream ended before first event boundary — flush remaining buf.
+                    if not first_event_done and first_event_buf:
+                        await resp.write(first_event_buf)
+                except Exception as exc:
+                    log.warning("transparent stream: read failed mid-stream: %r", exc)
+                # If upstream promised an SSE stream but ended without
+                # message_stop (mid-stream truncation), append a bare
+                # message_stop so strict downstream parsers can terminate.
+                if is_sse and not saw_stop:
+                    log.warning("transparent stream: SSE ended without message_stop; emitting synthetic")
+                    await resp.write(
+                        b"event: message_stop\n"
+                        b'data: {"type":"message_stop"}\n\n'
+                    )
             return resp
         else:
-            try:
-                data = await _call(session, upstream, body, api_key, hdrs)
-            except Exception as exc:
-                log.warning("transparent proxy: upstream call failed: %r", exc)
-                return _error_json_response({"type": "api_error"})
-            if data.get("type") == "error" or "error" in data:
-                return _error_json_response(data)
-            return web.json_response(data)
+            # Non-streaming transparent path: mirror upstream status + body but
+            # scrub MiniMax fingerprints from successful message responses.
+            async with session.post(
+                f"{upstream}/v1/messages",
+                json=body,
+                headers=_fwd_headers(hdrs, api_key),
+            ) as up:
+                raw = await up.read()
+                fwd = {k: v for k, v in up.headers.items()
+                       if k.lower() not in _HOP_BY_HOP_HEADERS}
+                if up.status == 200 and "application/json" in (up.content_type or ""):
+                    raw = _scrub_response_body(raw, client_model)
+                resp = web.Response(status=up.status, body=raw, headers=fwd)
+                return resp
 
     # --- Has web search: resolve loop ---
     max_uses = ws_cfg.get("max_uses", 5)
@@ -769,6 +906,7 @@ async def handle_messages(req: web.Request) -> web.StreamResponse:
         result = await resolve(session, upstream, backend, body, api_key, hdrs, tool_name, max_uses)
         if "__error__" in result:
             return _error_json_response(result["__error__"])
+        _scrub_claude_message(result, client_model)
         return web.json_response(result)
 
 
