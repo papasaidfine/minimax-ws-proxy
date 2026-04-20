@@ -33,6 +33,45 @@ log = logging.getLogger("minimax-ws-proxy")
 INTERNAL_TOOL = "__proxy_web_search__"
 ANTHROPIC_WS_TYPES = {"web_search_20250305", "web_search_20260209"}
 
+# Request body fields that MiniMax's Anthropic-compatible endpoint rejects
+# with `400 invalid params`. Claude Code 2.1.114+ sends `output_config` on its
+# background session-title haiku call; MiniMax (and other China compat
+# endpoints like GLM/Kimi) have not adopted structured outputs yet.
+UNSUPPORTED_UPSTREAM_FIELDS = ("output_config",)
+
+
+def _inject_json_output_hint(body: dict, dropped: dict) -> None:
+    """Nudge upstream to return raw JSON after `output_config` was stripped.
+
+    Without structured outputs, MiniMax tends to wrap its JSON response in a
+    ```json ... ``` markdown fence and add a thinking block, which breaks
+    strict `JSON.parse` on the client side. We append a short directive to
+    the system prompt — and include the original JSON schema if one was
+    present — so the model at least has the shape to match.
+    """
+    cfg = dropped.get("output_config")
+    if not isinstance(cfg, dict):
+        return
+    fmt = cfg.get("format") or {}
+    if fmt.get("type") != "json_schema":
+        return
+
+    parts = [
+        "Output a single raw JSON object only. No markdown code fences, no prose, no explanation, no thinking — just the JSON.",
+    ]
+    schema = fmt.get("schema")
+    if schema is not None:
+        parts.append("The JSON must match this schema:\n" + json.dumps(schema, ensure_ascii=False))
+    hint = "\n\n".join(parts)
+
+    system = body.get("system")
+    if system is None:
+        body["system"] = hint
+    elif isinstance(system, str):
+        body["system"] = system + "\n\n" + hint
+    elif isinstance(system, list):
+        body["system"] = [*system, {"type": "text", "text": hint}]
+
 # Hop-by-hop + length headers we must not blindly forward when mirroring an
 # upstream response. aiohttp handles framing itself.
 _HOP_BY_HOP_HEADERS = frozenset({
@@ -799,6 +838,11 @@ async def handle_messages(req: web.Request) -> web.StreamResponse:
     hdrs = {k.lower(): v for k, v in req.headers.items()}
     streaming = body.get("stream", False)
     upstream: str = req.app["upstream"]
+
+    dropped = {k: body.pop(k) for k in UNSUPPORTED_UPSTREAM_FIELDS if k in body}
+    if dropped:
+        log.info("Dropped unsupported field(s): %s", list(dropped))
+        _inject_json_output_hint(body, dropped)
 
     if body.get("tools"):
         tool_types = [t.get("type", t.get("name", "?")) for t in body["tools"]]
