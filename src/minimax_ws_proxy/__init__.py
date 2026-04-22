@@ -980,7 +980,9 @@ async def handle_other(req: web.Request) -> web.StreamResponse:
 
 
 def create_app(upstream: str, backend: SearchBackend | None) -> web.Application:
-    app = web.Application()
+    # 20 MiB — aiohttp's default of 1 MiB is too small for Claude requests
+    # that carry full tool definitions + long conversation history.
+    app = web.Application(client_max_size=20 * 1024 * 1024)
     app["upstream"] = upstream
     if backend is not None:
         app["backend"] = backend
